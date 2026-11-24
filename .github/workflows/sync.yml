@@ -1,0 +1,333 @@
+name: Tango upstream sync
+
+on:
+  workflow_dispatch:
+    inputs:
+      go_version:
+        description: 'Official upstream Go tag (go1.26.X)'
+        required: true
+        default: 'go1.26.11'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tango-release-sync
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  GO_VERSION: ${{ inputs.go_version }}
+  GO_UPSTREAM: https://github.com/golang/go.git
+  INITIAL_BRANCH: release-branch.tango1.26
+  RELEASE_BRANCH: release
+
+jobs:
+  test:
+    name: Merge upstream and test candidate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    outputs:
+      base: ${{ steps.merge.outputs.base }}
+      base_ref: ${{ steps.merge.outputs.base_ref }}
+      old_release: ${{ steps.merge.outputs.old_release }}
+      candidate: ${{ steps.merge.outputs.candidate }}
+      upstream: ${{ steps.merge.outputs.upstream }}
+      tag: ${{ steps.merge.outputs.tag }}
+      artifact: ${{ steps.merge.outputs.artifact }}
+    env:
+      GOTOOLCHAIN: local
+      GOENV: 'off'
+      GOAMD64: v1
+      CGO_ENABLED: '1'
+      GO_TEST_SHORT: 'false'
+
+    steps:
+      - name: Validate input
+        id: version
+        run: |
+          set -euo pipefail
+          [[ "$GO_VERSION" =~ ^go1\.26\.(0|[1-9][0-9]*)$ ]] || {
+            echo '::error::Expected a tag in the form go1.26.X'
+            exit 1
+          }
+          echo "bootstrap=${GO_VERSION#go}" >> "$GITHUB_OUTPUT"
+
+      - name: Merge Go upstream into a local candidate
+        id: merge
+        run: |
+          set -euo pipefail
+          git init tango
+          cd tango
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+          git remote add upstream "$GO_UPSTREAM"
+
+          release_ref="refs/heads/$RELEASE_BRANCH"
+          old_release="$(git ls-remote --refs origin "$release_ref" | cut -f1)"
+          if [[ -n "$old_release" ]]; then
+            base_ref="$release_ref"
+          else
+            base_ref="refs/heads/$INITIAL_BRANCH"
+          fi
+
+          # No shallow fetch: preserve the original Go/Tango ancestry.
+          git fetch --no-tags origin "$base_ref"
+          base="$(git rev-parse FETCH_HEAD)"
+          if [[ -n "$old_release" ]]; then
+            [[ "$base" == "$old_release" ]] || {
+              echo '::error::Release branch changed while preparing. Retry.'
+              exit 1
+            }
+          fi
+          git switch --create candidate "$base"
+
+          current="$(head -n 1 VERSION)"
+          [[ "$current" =~ ^go1\.26\.(0|[1-9][0-9]*)$ ]]
+          [[ -s VERSION.tango ]]
+          tango_version="$(head -n 1 VERSION.tango)"
+          if [[ "$(printf '%s\n%s\n' "$current" "$GO_VERSION" | sort -V | tail -n 1)" != "$GO_VERSION" ]]; then
+            echo "::error::Downgrades are forbidden ($current -> $GO_VERSION)."
+            exit 1
+          fi
+
+          # Keep upstream tags separate from fork tags.
+          git fetch --no-tags upstream "refs/tags/$GO_VERSION:refs/upstream/$GO_VERSION"
+          upstream_sha="$(git rev-parse "refs/upstream/$GO_VERSION^{commit}")"
+          git merge-base "$base" "$upstream_sha" >/dev/null
+
+          if ! git merge --no-ff --no-edit "$upstream_sha"; then
+            echo '::error::Merge failed. Resolve the conflicts manually; release was not modified.'
+            git status --short
+            git diff --name-only --diff-filter=U
+            git diff --cc > "$RUNNER_TEMP/merge-conflicts.diff" || true
+            exit 1
+          fi
+
+          [[ "$(head -n 1 VERSION)" == "$GO_VERSION" ]]
+          [[ "$(head -n 1 VERSION.tango)" == "$tango_version" ]]
+          git merge-base --is-ancestor "$base" HEAD
+          git merge-base --is-ancestor "$upstream_sha" HEAD
+          candidate="$(git rev-parse HEAD)"
+          tag="tango${GO_VERSION#go}"
+          artifact="tango-candidate-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+
+          # Never move an existing release tag.
+          existing="$(git ls-remote --refs origin "refs/tags/$tag" | cut -f1)"
+          if [[ -n "$existing" ]]; then
+            git fetch --no-tags origin "refs/tags/$tag:refs/existing/$tag"
+            [[ "$(git rev-parse "refs/existing/$tag^{commit}")" == "$candidate" ]] || {
+              echo "::error::Tag $tag already exists on a different commit."
+              exit 1
+            }
+          fi
+
+          {
+            echo "base=$base"
+            echo "base_ref=$base_ref"
+            echo "old_release=$old_release"
+            echo "candidate=$candidate"
+            echo "upstream=$upstream_sha"
+            echo "tag=$tag"
+            echo "artifact=$artifact"
+          } >> "$GITHUB_OUTPUT"
+          printf '### Merge candidate\n\n- Base: `%s`\n- Upstream: `%s`\n- Candidate: `%s`\n- Tag: `%s`\n' \
+            "$base" "$upstream_sha" "$candidate" "$tag" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install official bootstrap Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ steps.version.outputs.bootstrap }}
+          check-latest: false
+          cache: false
+
+      - name: Configure bootstrap GOROOT
+        run: |
+          set -euo pipefail
+          echo "GOROOT_BOOTSTRAP=$(go env GOROOT)" >> "$GITHUB_ENV"
+
+      - name: Build Tango and run Go distribution tests
+        working-directory: tango/src
+        run: |
+          set -euo pipefail
+          unset GOROOT
+          bash ./all.bash 2>&1 | tee "$RUNNER_TEMP/tango-all.log"
+
+      - name: Verify compiled toolchain
+        working-directory: tango
+        run: |
+          set -euo pipefail
+          unset GOROOT
+          bin/go version
+          bin/go bversion
+          [[ "$(bin/go version)" == "go version $GO_VERSION linux/amd64" ]]
+          [[ "$(bin/go bversion)" == "Tango bversion $(head -n 1 VERSION.tango) linux/amd64" ]]
+          [[ "$(bin/go env GOROOT)" == "$PWD" ]]
+
+      - name: Balanced GC runtime tests
+        working-directory: tango/src
+        run: |
+          set -euo pipefail
+          unset GOROOT
+          GODEBUG=gab=2 ../bin/go test -short -count=1 runtime \
+            2>&1 | tee "$RUNNER_TEMP/tango-gab.log"
+
+      - name: Beast mode integration smoke test
+        working-directory: tango
+        run: |
+          set -euo pipefail
+          unset GOROOT
+          cat > "$RUNNER_TEMP/tango-smoke.go" <<'GO'
+          package main
+
+          import (
+              "fmt"
+              "runtime"
+          )
+
+          type node struct {
+              next *node
+              value int64
+          }
+
+          var root *node
+
+          func main() {
+              for i := int64(0); i < 100000; i++ {
+                  root = &node{root, i}
+              }
+              runtime.GC()
+              var sum int64
+              for p := root; p != nil; p = p.next {
+                  sum += p.value
+              }
+              if sum != 4999950000 {
+                  panic(sum)
+              }
+              fmt.Println("OK")
+          }
+          GO
+          GOAMD64=v3 bin/go build -opt=beast \
+            -o "$RUNNER_TEMP/tango-smoke" "$RUNNER_TEMP/tango-smoke.go"
+          [[ "$("$RUNNER_TEMP/tango-smoke")" == OK ]]
+          [[ "$(GODEBUG=gab=2 "$RUNNER_TEMP/tango-smoke")" == OK ]]
+
+      - name: Package the exact tested Git commit
+        working-directory: tango
+        env:
+          BASE: ${{ steps.merge.outputs.base }}
+          CANDIDATE: ${{ steps.merge.outputs.candidate }}
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "$CANDIDATE" ]]
+          git diff --exit-code HEAD --
+          # Include base itself, so a no-op merge can also be packaged.
+          # The publish job fetches the original base with full ancestry.
+          git bundle create "$RUNNER_TEMP/candidate.bundle" \
+            refs/heads/candidate "^$BASE^"
+          git bundle verify "$RUNNER_TEMP/candidate.bundle"
+
+      - name: Upload tested candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.merge.outputs.artifact }}
+          path: ${{ runner.temp }}/candidate.bundle
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: Upload diagnostic logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: tango-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/tango-*.log
+            ${{ runner.temp }}/merge-conflicts.diff
+          if-no-files-found: ignore
+          retention-days: 14
+
+  publish:
+    name: Promote tested commit to release
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      BASE: ${{ needs.test.outputs.base }}
+      BASE_REF: ${{ needs.test.outputs.base_ref }}
+      OLD_RELEASE: ${{ needs.test.outputs.old_release }}
+      CANDIDATE: ${{ needs.test.outputs.candidate }}
+      UPSTREAM: ${{ needs.test.outputs.upstream }}
+      TAG: ${{ needs.test.outputs.tag }}
+
+    steps:
+      - name: Download tested candidate
+        uses: actions/download-artifact@v5
+        with:
+          name: ${{ needs.test.outputs.artifact }}
+          path: ${{ runner.temp }}/tango-candidate
+
+      - name: Atomically update release branch and tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh auth setup-git
+          # Bare repository: do not check out or execute candidate code here.
+          git init --bare tango.git
+          cd tango.git
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+
+          release_ref="refs/heads/$RELEASE_BRANCH"
+          current="$(git ls-remote --refs origin "$release_ref" | cut -f1)"
+          [[ "$current" == "$OLD_RELEASE" ]] || {
+            echo '::error::Release changed during testing. Run the workflow again.'
+            exit 1
+          }
+          git fetch --no-tags origin "$BASE_REF"
+          [[ "$(git rev-parse FETCH_HEAD)" == "$BASE" ]] || {
+            echo '::error::Base changed during testing. Run the workflow again.'
+            exit 1
+          }
+
+          bundle="$RUNNER_TEMP/tango-candidate/candidate.bundle"
+          git bundle verify "$bundle"
+          git fetch --no-tags "$bundle" refs/heads/candidate:refs/heads/candidate
+          [[ "$(git rev-parse refs/heads/candidate)" == "$CANDIDATE" ]]
+          git merge-base --is-ancestor "$BASE" "$CANDIDATE"
+          git merge-base --is-ancestor "$UPSTREAM" "$CANDIDATE"
+          [[ "$(git show "$CANDIDATE:VERSION" | head -n 1)" == "$GO_VERSION" ]]
+
+          # Keep existing tags immutable; reruns with the same SHA are allowed.
+          tag_ref="refs/tags/$TAG"
+          existing="$(git ls-remote --refs origin "$tag_ref" | cut -f1)"
+          if [[ -n "$existing" ]]; then
+            git fetch --no-tags origin "$tag_ref:$tag_ref"
+            [[ "$(git rev-parse "$tag_ref^{commit}")" == "$CANDIDATE" ]] || {
+              echo "::error::Tag $TAG points to a different commit."
+              exit 1
+            }
+          else
+            git tag -a "$TAG" "$CANDIDATE" -m "Tango based on $GO_VERSION"
+          fi
+
+          # The explicit lease prevents racing an external update. Because
+          # ancestry was checked, this can only fast-forward an existing branch.
+          # An empty lease means the release branch must not exist yet.
+          git push --atomic \
+            --force-with-lease="$release_ref:$OLD_RELEASE" \
+            origin \
+            "$CANDIDATE:$release_ref" \
+            "$tag_ref:$tag_ref"
+
+          printf '### Published\n\n- Release branch: `%s`\n- Tag: `%s`\n- Tested SHA: `%s`\n' \
+            "$RELEASE_BRANCH" "$TAG" "$CANDIDATE" >> "$GITHUB_STEP_SUMMARY"
