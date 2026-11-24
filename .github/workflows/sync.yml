@@ -150,7 +150,14 @@ jobs:
         run: |
           set -euo pipefail
           echo "GOROOT_BOOTSTRAP=$(go env GOROOT)" >> "$GITHUB_ENV"
-
+      
+      - name: Prepare checksum database directory
+        run: |
+          sudo install -d -m 0755 \
+            -o "$(id -u)" \
+            -g "$(id -g)" \
+            /nonexist-gopath/pkg/sumdb
+      
       - name: Build Tango and run Go distribution tests
         working-directory: tango/src
         run: |
