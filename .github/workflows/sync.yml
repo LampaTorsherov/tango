@@ -45,6 +45,7 @@ jobs:
       GOAMD64: v1
       CGO_ENABLED: '1'
       GO_TEST_SHORT: 'false'
+      GO_TEST_TIMEOUT_SCALE: '4'
 
     steps:
       - name: Validate input
@@ -150,20 +151,74 @@ jobs:
         run: |
           set -euo pipefail
           echo "GOROOT_BOOTSTRAP=$(go env GOROOT)" >> "$GITHUB_ENV"
-      
-      - name: Prepare checksum database directory
+
+      # run.bash deliberately sets GOPATH=/nonexist-gopath. Long tests
+      # need both the default module cache and checksum database to be writable.
+      - name: Prepare writable test module and checksum caches
         run: |
-          sudo install -d -m 0755 \
-            -o "$(id -u)" \
-            -g "$(id -g)" \
+          set -euo pipefail
+          sudo install -d -m 0755 -o "$(id -u)" -g "$(id -g)" \
+            /nonexist-gopath/pkg \
+            /nonexist-gopath/pkg/mod \
             /nonexist-gopath/pkg/sumdb
-      
-      - name: Build Tango and run Go distribution tests
+          test -w /nonexist-gopath/pkg/mod
+          test -w /nonexist-gopath/pkg/sumdb
+          lscpu
+          free -h
+          for f in /sys/fs/cgroup/cpu.max /sys/fs/cgroup/memory.max; do
+            if [[ -r "$f" ]]; then
+              printf '%s: ' "$f"
+              cat "$f"
+            fi
+          done
+
+      # Split all.bash into its original build and test phases so the
+      # expensive regression test can run in isolation before the full suite.
+      - name: Build Tango toolchain
         working-directory: tango/src
         run: |
           set -euo pipefail
           unset GOROOT
-          bash ./all.bash 2>&1 | tee "$RUNNER_TEMP/tango-all.log"
+          bash ./make.bash --no-banner 2>&1 | tee "$RUNNER_TEMP/tango-build.log"
+
+      - name: Isolated GAB map preemption regression test
+        id: gab_preflight
+        working-directory: tango/src
+        run: |
+          set -euo pipefail
+          unset GOROOT GOMODCACHE
+          export GOPATH=/nonexist-gopath
+          export PATH="$PWD/../bin:$PATH"
+          /usr/bin/time -v ../bin/go test -v -count=1 -timeout=15m \
+            -run '^TestGabMapAsyncPreemption$' runtime \
+            2>&1 | tee "$RUNNER_TEMP/tango-gab-preflight.log"
+
+      # Diagnostic only. A baseline result never overrides a failed candidate.
+      - name: Compare original base on the same runner if GAB preflight failed
+        if: ${{ failure() && steps.gab_preflight.outcome == 'failure' }}
+        working-directory: tango
+        env:
+          BASE: ${{ steps.merge.outputs.base }}
+        run: |
+          set -euo pipefail
+          unset GOROOT GOMODCACHE
+          base_dir="$RUNNER_TEMP/tango-base"
+          git worktree add --detach "$base_dir" "$BASE"
+          cd "$base_dir/src"
+          bash ./make.bash --no-banner 2>&1 | tee "$RUNNER_TEMP/tango-base-build.log"
+          export GOPATH=/nonexist-gopath
+          export PATH="$PWD/../bin:$PATH"
+          /usr/bin/time -v ../bin/go test -v -count=1 -timeout=15m \
+            -run '^TestGabMapAsyncPreemption$' runtime \
+            2>&1 | tee "$RUNNER_TEMP/tango-base-gab.log"
+
+      - name: Run full Go distribution tests
+        working-directory: tango/src
+        run: |
+          set -euo pipefail
+          unset GOROOT
+          bash ./run.bash --no-rebuild 2>&1 | tee "$RUNNER_TEMP/tango-all.log"
+          ../bin/go tool dist banner
 
       - name: Verify compiled toolchain
         working-directory: tango
@@ -181,7 +236,7 @@ jobs:
         run: |
           set -euo pipefail
           unset GOROOT
-          GODEBUG=gab=2 ../bin/go test -short -count=1 runtime \
+          GODEBUG=gab=2 ../bin/go test -short -count=1 -timeout=40m runtime \
             2>&1 | tee "$RUNNER_TEMP/tango-gab.log"
 
       - name: Beast mode integration smoke test
