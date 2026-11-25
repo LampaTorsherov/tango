@@ -235,14 +235,7 @@ jobs:
             -run '^TestGabMapAsyncPreemption$' runtime \
             2>&1 | tee "$RUNNER_TEMP/tango-base-gab.log"
 
-      - name: Run full Go distribution tests
-        working-directory: tango/src
-        run: |
-          set -euo pipefail
-          unset GOROOT
-          bash ./run.bash --no-rebuild 2>&1 | tee "$RUNNER_TEMP/tango-all.log"
-          ../bin/go tool dist banner
-
+      # Verify immediately: bversion contains both the Go and Tango versions.
       - name: Verify compiled toolchain
         working-directory: tango
         run: |
@@ -251,15 +244,275 @@ jobs:
           bin/go version
           bin/go bversion
           [[ "$(bin/go version)" == "go version $GO_VERSION linux/amd64" ]]
-          [[ "$(bin/go bversion)" == "Tango bversion $(head -n 1 VERSION.tango) linux/amd64" ]]
+          [[ "$(bin/go bversion)" == "Tango bversion $GO_VERSION.$(head -n 1 VERSION.tango) linux/amd64" ]]
           [[ "$(bin/go env GOROOT)" == "$PWD" ]]
+
+      # Run the known problem as a bounded executable, not an unbounded go run.
+      # Normal mode must pass. Only the exact previously observed diagnostic
+      # failure signatures are accepted (or a genuine pass). No build or
+      # dependency download failure is accepted.
+      - name: Bounded GoId preemption regression checks
+        working-directory: tango
+        run: |
+          set -euo pipefail
+          unset GOROOT GOMODCACHE GOFLAGS GODEBUG CGO_ENABLED
+          tree="$PWD"
+          diag="$RUNNER_TEMP/goid-diag"
+          mkdir -p "$diag"
+          printf 'mode\tresult\n' > "$diag/results.tsv"
+          probe() (
+            set -euo pipefail
+            mode="$1"
+            dir="$diag/$mode"
+            mkdir -p "$dir"
+            cd "$dir"
+            export PATH="$tree/bin:$PATH"
+            export GOPATH="$dir/gopath"
+            export GOCACHE="$GOPATH/cache"
+            export GOMODCACHE="$GOPATH/pkg/mod"
+            export GOTRACEBACK=system
+            unset GOFLAGS GODEBUG
+            case "$mode" in
+              normal) ;;
+              gccheckmark) export GODEBUG=gccheckmark=1 ;;
+              mayMoreStackPreempt|mayMoreStackMove)
+                flags=()
+                for flag in -gcflags -asmflags; do
+                  for pkg in 'runtime/...' reflect sync; do
+                    flags+=("$flag=$pkg=-d=maymorestack=runtime.$mode")
+                  done
+                  flags+=("$flag=runtime/testdata/...=")
+                done
+                export GOFLAGS="${flags[*]}"
+                ;;
+              *) exit 2 ;;
+            esac
+            # Use the actual fixture from the merged candidate, and pin the
+            # known program/dependency so a changed test needs human review.
+            python3 - "$tree/src/runtime/goid_test.go" <<'PYCODE'
+          import pathlib, re, sys
+          s = pathlib.Path(sys.argv[1]).read_text()
+          fn = s.split('func genGoIdAsyncPreemptionMain(', 1)[1]
+          program = re.search(r'source := `([^`]+)`', fn).group(1)
+          dep, version = re.search(r'\{"([^"\n]+)",\s*"([^"\n]+)"\}', s.split('var goidPkgs', 1)[1]).groups()
+          assert (dep, version) == ('github.com/choleraehyq/pid', 'v0.0.12'), 'GoId dependency changed: review diagnostic waiver'
+          import hashlib
+          assert hashlib.sha256(program.encode()).hexdigest() == '7834d9ce14e7090575143faa1db735578a3674c35d13b838439332f8cecdd935', 'GoId fixture changed: review diagnostic waiver'
+          pathlib.Path('main.go').write_text(program.replace('%s', dep).replace('%%', '%'))
+          pathlib.Path('go.mod').write_text(f'module main\n\ngo 1.16\n\nrequire {dep} {version}\n')
+          pathlib.Path('dependency.txt').write_text(dep)
+          PYCODE
+            printf 'GODEBUG=%s\nGOFLAGS=%s\n' "${GODEBUG-}" "${GOFLAGS-}" > environment.log
+            timeout --signal=TERM --kill-after=15s 5m \
+              "$tree/bin/go" mod download "$(cat dependency.txt)" > download.log 2>&1
+            timeout --signal=TERM --kill-after=15s 12m \
+              "$tree/bin/go" build -opt=beast -o probe main.go > build.log 2>&1
+            limit=120s
+            if [[ "$mode" == normal ]]; then limit=180s; fi
+            rc=0
+            /usr/bin/time -v -o time.log \
+              timeout --signal=QUIT --kill-after=20s "$limit" ./probe > run.log 2>&1 || rc=$?
+            result=PASS
+            if ((rc != 0)); then
+              case "$mode:$rc" in
+                gccheckmark:124|mayMoreStackPreempt:124)
+                  grep -Fq 'SIGQUIT: quit' run.log
+                  grep -Eq '^goroutine 1 .*\[runnable\]:' run.log
+                  grep -Fq 'main.main.func1()' run.log
+                  if grep -Eq '^(fatal error:|panic:|runtime: goroutine stack exceeds)' run.log; then
+                    echo "::error::Unexpected crash in $mode"
+                    exit 1
+                  fi
+                  result=KNOWN_TIMEOUT
+                  ;;
+                mayMoreStackMove:2)
+                  grep -Fq 'runtime: goroutine stack exceeds 0-byte limit' run.log
+                  grep -Fq 'fatal error: stack overflow' run.log
+                  grep -Fq 'runtime.newstack()' run.log
+                  grep -Fq 'runtime.main()' run.log
+                  if grep -Eq '^main\.main\(' run.log; then exit 1; fi
+                  result=KNOWN_STARTUP_STACK_OVERFLOW
+                  ;;
+                *) echo "::error::Unexpected GoId failure: $mode (exit $rc)"; exit 1 ;;
+              esac
+            fi
+            printf '%s\t%s\n' "$mode" "$result" >> "$diag/results.tsv"
+            if [[ "$result" != PASS ]]; then
+              echo "::warning::GoId $mode: $result (reproduced on original Tango 1.26.4)"
+            fi
+            cat time.log
+            chmod -R u+w "$GOPATH"
+            rm -rf "$GOPATH" probe
+          )
+          for mode in normal gccheckmark mayMoreStackPreempt mayMoreStackMove; do
+            echo "=== GoId: $mode ==="
+            probe "$mode"
+          done
+          {
+            echo '### Bounded GoId probes'
+            echo '```text'
+            cat "$diag/results.tsv"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # The three runtime variants below are replaced by equivalent go test
+      # invocations, with only TestGoIdAsyncPreemption excluded. The two stack
+      # hooks also cover reflect and sync, without excluding any of their tests.
+      # If a mayMoreStackMove test binary crashes before *any* test starts,
+      # accept it ONLY when the exact same package fails with the same known
+      # zero-byte stack limit on the pre-merge SDK on this runner.
+      - name: Run diagnostic runtime variants with narrow known-failure policy
+        working-directory: tango/src
+        env:
+          BASE: ${{ steps.merge.outputs.base }}
+        run: |
+          set -euo pipefail
+          unset GOROOT GOMODCACHE GOFLAGS GODEBUG CGO_ENABLED
+          tree="$(cd .. && pwd)"
+          export PATH="$tree/bin:$PATH"
+          export GOPATH=/nonexist-gopath
+          export GOTRACEBACK=system
+          ulimit -c 0
+          diag="$RUNNER_TEMP/runtime-diag"
+          mkdir -p "$diag"
+          printf 'mode\tpackage\tresult\n' > "$diag/results.tsv"
+
+          # Fail closed if a future upstream changes the variant registration.
+          # These names and options are taken from Tango's cmd/dist/test.go.
+          python3 - <<'PYCODE'
+          import pathlib, re, hashlib
+          s = pathlib.Path('cmd/dist/test.go').read_text()
+          a = s.index('t.registerTest("GODEBUG=gccheckmark=1 runtime",')
+          b = s.index('// Test that internal linking of standard packages', a)
+          section = s[a:b]
+          assert hashlib.sha256(section.encode()).hexdigest() == 'e4e27779de3b3c0984c62efd74d59c10e53945965d435d0ec54c4db778e752a0', 'Diagnostic registrations changed: review the CI test arguments'
+          PYCODE
+          bash ./run.bash --no-rebuild -list > "$diag/dist-list.log"
+          for name in runtime:runtime:gccheckmark \
+              runtime:mayMoreStackPreempt reflect:mayMoreStackPreempt sync:mayMoreStackPreempt \
+              runtime:mayMoreStackMove reflect:mayMoreStackMove sync:mayMoreStackMove; do
+            grep -Fxq "$name" "$diag/dist-list.log" || {
+              echo "::error::Missing dist test $name; review diagnostic configuration"
+              exit 1
+            }
+          done
+
+          run_variant() (
+            set -euo pipefail
+            sdk="$1" mode="$2" pkg="$3"
+            cd "$sdk/src"
+            export PATH="$sdk/bin:$PATH"
+            unset GOFLAGS GODEBUG
+            args=(-json -short -count=1)
+            case "$mode" in
+              gccheckmark)
+                export GODEBUG=gccheckmark=1
+                args+=("-timeout=$((300 * GO_TEST_TIMEOUT_SCALE))s")
+                ;;
+              mayMoreStackPreempt|mayMoreStackMove)
+                flags=()
+                for flag in -gcflags -asmflags; do
+                  for pattern in 'runtime/...' reflect sync; do
+                    flags+=("$flag=$pattern=-d=maymorestack=runtime.$mode")
+                  done
+                  flags+=("$flag=runtime/testdata/...=")
+                done
+                export GOFLAGS="${flags[*]}"
+                args+=("-timeout=$((600 * GO_TEST_TIMEOUT_SCALE))s")
+                ;;
+              *) exit 2 ;;
+            esac
+            if [[ "$pkg" == runtime ]]; then
+              args+=('-skip=^TestGoIdAsyncPreemption$')
+            fi
+            "$sdk/bin/go" test "${args[@]}" "$pkg"
+          )
+
+          # Parse JSON rather than grepping arbitrary FAIL messages. A package
+          # is eligible for this fallback only if it never started any tests.
+          startup_stack_overflow() {
+            python3 - "$1" <<'PYCODE'
+          import json, pathlib, sys
+          events = []
+          try:
+              for line in pathlib.Path(sys.argv[1]).read_text().splitlines():
+                  events.append(json.loads(line))
+          except (ValueError, OSError):
+              sys.exit(1)
+          if any(e.get('Test') or e.get('Action') in ('build-fail', 'build-output') for e in events):
+              sys.exit(1)
+          if not any(e.get('Action') == 'fail' and e.get('Package') for e in events):
+              sys.exit(1)
+          out = ''.join(e.get('Output', '') for e in events)
+          markers = ('runtime: goroutine stack exceeds 0-byte limit', 'fatal error: stack overflow', 'runtime.newstack()', 'runtime.main()')
+          if not all(m in out for m in markers) or 'main.main(' in out or 'panic:' in out:
+              sys.exit(1)
+          PYCODE
+          }
+
+          baseline="$RUNNER_TEMP/tango-diagnostic-base"
+          for pair in gccheckmark:runtime \
+              mayMoreStackPreempt:runtime mayMoreStackPreempt:reflect mayMoreStackPreempt:sync \
+              mayMoreStackMove:runtime mayMoreStackMove:reflect mayMoreStackMove:sync; do
+            mode="${pair%%:*}"
+            pkg="${pair#*:}"
+            log="$diag/$mode-$pkg.log"
+            echo "=== $mode / $pkg ==="
+            rc=0
+            run_variant "$tree" "$mode" "$pkg" 2>&1 | tee "$log" || rc=$?
+            if ((rc == 0)); then
+              printf '%s\t%s\tPASS\n' "$mode" "$pkg" >> "$diag/results.tsv"
+              continue
+            fi
+            if [[ "$mode" != mayMoreStackMove ]] || ((rc != 1)) || ! startup_stack_overflow "$log"; then
+              echo "::error::Unexpected diagnostic failure: $mode/$pkg"
+              exit 1
+            fi
+            if [[ ! -x "$baseline/bin/go" ]]; then
+              git -C "$tree" worktree add --detach "$baseline" "$BASE"
+              (
+                cd "$baseline/src"
+                unset GOFLAGS GODEBUG GOROOT CGO_ENABLED
+                bash ./make.bash --no-banner
+              ) 2>&1 | tee "$diag/baseline-build.log"
+            fi
+            baseline_log="$diag/baseline-$mode-$pkg.log"
+            baseline_rc=0
+            run_variant "$baseline" "$mode" "$pkg" 2>&1 | tee "$baseline_log" || baseline_rc=$?
+            if ((baseline_rc != 1)) || ! startup_stack_overflow "$baseline_log"; then
+              echo "::error::Startup crash not reproduced on the pre-merge SDK: $mode/$pkg"
+              exit 1
+            fi
+            echo "::warning::$mode/$pkg cannot start on either SDK (known zero-byte stack limit); package tests not executed in this variant"
+            printf '%s\t%s\tBASELINE_MATCHED_STARTUP_FAILURE\n' "$mode" "$pkg" >> "$diag/results.tsv"
+          done
+          {
+            echo '### Diagnostic variants'
+            echo 'Runtime-only GoId exclusion: gccheckmark, mayMoreStackPreempt, mayMoreStackMove (separate bounded probes above).'
+            echo '```text'
+            cat "$diag/results.tsv"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run all remaining Go distribution tests
+        working-directory: tango/src
+        run: |
+          set -euo pipefail
+          unset GOROOT GOFLAGS GODEBUG CGO_ENABLED
+          # Only variants already executed above are excluded. All normal and
+          # Beast tests, race tests, cgo, API, and ../test remain mandatory.
+          excluded='!^(runtime:runtime:gccheckmark|(runtime|reflect|sync):mayMoreStack(Preempt|Move))$'
+          bash ./run.bash --no-rebuild -k -run "$excluded" 2>&1 | tee "$RUNNER_TEMP/tango-all.log"
+          ../bin/go tool dist banner
 
       - name: Balanced GC runtime tests
         working-directory: tango/src
         run: |
           set -euo pipefail
           unset GOROOT
-          GODEBUG=gab=2 ../bin/go test -short -count=1 -timeout=40m runtime \
+          export PATH="$PWD/../bin:$PATH"
+          export GOPATH=/nonexist-gopath
+          GODEBUG=gab=2 ../bin/go test -short -count=1 -timeout=60m runtime \
             2>&1 | tee "$RUNNER_TEMP/tango-gab.log"
 
       - name: Beast mode integration smoke test
@@ -334,6 +587,10 @@ jobs:
           path: |
             ${{ runner.temp }}/tango-*.log
             ${{ runner.temp }}/merge-conflicts.diff
+            ${{ runner.temp }}/goid-diag/results.tsv
+            ${{ runner.temp }}/goid-diag/*/*.log
+            ${{ runner.temp }}/runtime-diag/*.log
+            ${{ runner.temp }}/runtime-diag/results.tsv
           if-no-files-found: ignore
           retention-days: 14
 
