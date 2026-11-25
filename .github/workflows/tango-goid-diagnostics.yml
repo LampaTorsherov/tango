@@ -1,0 +1,298 @@
+name: Tango GoId diagnostics
+
+on:
+  workflow_dispatch:
+    inputs:
+      go_version:
+        description: 'Official upstream Go tag (go1.26.X)'
+        required: true
+        default: 'go1.26.11'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tango-goid-diagnostics
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  GO_VERSION: ${{ inputs.go_version }}
+  GO_UPSTREAM: https://github.com/golang/go.git
+  INITIAL_BRANCH: release-branch.tango1.26
+  RELEASE_BRANCH: release
+
+jobs:
+  test:
+    name: Compare GoId preemption before and after merge
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      GOTOOLCHAIN: local
+      GOENV: 'off'
+      GOAMD64: v1
+      GO_TEST_SHORT: 'false'
+      GO_TEST_TIMEOUT_SCALE: '6'
+
+    steps:
+      - name: Validate input
+        id: version
+        run: |
+          set -euo pipefail
+          [[ "$GO_VERSION" =~ ^go1\.26\.(0|[1-9][0-9]*)$ ]] || {
+            echo '::error::Expected a tag in the form go1.26.X'
+            exit 1
+          }
+          echo "bootstrap=${GO_VERSION#go}" >> "$GITHUB_OUTPUT"
+
+      - name: Merge Go upstream into a local candidate
+        id: merge
+        run: |
+          set -euo pipefail
+          git init tango
+          cd tango
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+          git remote add upstream "$GO_UPSTREAM"
+
+          release_ref="refs/heads/$RELEASE_BRANCH"
+          old_release="$(git ls-remote --refs origin "$release_ref" | cut -f1)"
+          if [[ -n "$old_release" ]]; then
+            base_ref="$release_ref"
+          else
+            base_ref="refs/heads/$INITIAL_BRANCH"
+          fi
+
+          # No shallow fetch: preserve the original Go/Tango ancestry.
+          git fetch --no-tags origin "$base_ref"
+          base="$(git rev-parse FETCH_HEAD)"
+          if [[ -n "$old_release" ]]; then
+            [[ "$base" == "$old_release" ]] || {
+              echo '::error::Release branch changed while preparing. Retry.'
+              exit 1
+            }
+          fi
+          git switch --create candidate "$base"
+
+          current="$(head -n 1 VERSION)"
+          [[ "$current" =~ ^go1\.26\.(0|[1-9][0-9]*)$ ]]
+          [[ -s VERSION.tango ]]
+          tango_version="$(head -n 1 VERSION.tango)"
+          if [[ "$(printf '%s\n%s\n' "$current" "$GO_VERSION" | sort -V | tail -n 1)" != "$GO_VERSION" ]]; then
+            echo "::error::Downgrades are forbidden ($current -> $GO_VERSION)."
+            exit 1
+          fi
+
+          # Keep upstream tags separate from fork tags.
+          git fetch --no-tags upstream "refs/tags/$GO_VERSION:refs/upstream/$GO_VERSION"
+          upstream_sha="$(git rev-parse "refs/upstream/$GO_VERSION^{commit}")"
+          git merge-base "$base" "$upstream_sha" >/dev/null
+
+          if ! git merge --no-ff --no-edit "$upstream_sha"; then
+            echo '::error::Merge failed. Resolve the conflicts manually; release was not modified.'
+            git status --short
+            git diff --name-only --diff-filter=U
+            git diff --cc > "$RUNNER_TEMP/merge-conflicts.diff" || true
+            exit 1
+          fi
+
+          [[ "$(head -n 1 VERSION)" == "$GO_VERSION" ]]
+          [[ "$(head -n 1 VERSION.tango)" == "$tango_version" ]]
+          git merge-base --is-ancestor "$base" HEAD
+          git merge-base --is-ancestor "$upstream_sha" HEAD
+          # Fix the contradictory test inherited from Tango 1.26.4.
+          # Commit before recording the candidate SHA, so the exact tested
+          # tree (including this fixture correction) is promoted on success.
+          fixture=src/cmd/go/testdata/script/godebug_decoratemappings_comment.txt
+          if grep -Fxq '//go:debug decoratemappings=1' "$fixture"; then
+            grep -Fq 'Programs with //go:debug decoratemappings=0 should never see annotations.' "$fixture"
+            [[ "$(grep -Fxc '//go:debug decoratemappings=1' "$fixture")" == 1 ]]
+            sed -i 's|^//go:debug decoratemappings=1$|//go:debug decoratemappings=0|' "$fixture"
+            git add -- "$fixture"
+            git commit -m 'cmd/go: fix Tango decoratemappings test fixture'
+          fi
+          grep -Fxq '//go:debug decoratemappings=0' "$fixture"
+
+          candidate="$(git rev-parse HEAD)"
+          tag="tango${GO_VERSION#go}"
+          artifact="tango-candidate-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+
+          # Never move an existing release tag.
+          existing="$(git ls-remote --refs origin "refs/tags/$tag" | cut -f1)"
+          if [[ -n "$existing" ]]; then
+            git fetch --no-tags origin "refs/tags/$tag:refs/existing/$tag"
+            [[ "$(git rev-parse "refs/existing/$tag^{commit}")" == "$candidate" ]] || {
+              echo "::error::Tag $tag already exists on a different commit."
+              exit 1
+            }
+          fi
+
+          {
+            echo "base=$base"
+            echo "base_ref=$base_ref"
+            echo "old_release=$old_release"
+            echo "candidate=$candidate"
+            echo "upstream=$upstream_sha"
+            echo "tag=$tag"
+            echo "artifact=$artifact"
+          } >> "$GITHUB_OUTPUT"
+          printf '### Merge candidate\n\n- Base: `%s`\n- Upstream: `%s`\n- Candidate: `%s`\n- Tag: `%s`\n' \
+            "$base" "$upstream_sha" "$candidate" "$tag" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install official bootstrap Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ steps.version.outputs.bootstrap }}
+          check-latest: false
+          cache: false
+
+      - name: Configure bootstrap GOROOT
+        run: |
+          set -euo pipefail
+          echo "GOROOT_BOOTSTRAP=$(go env GOROOT)" >> "$GITHUB_ENV"
+
+      # run.bash deliberately sets GOPATH=/nonexist-gopath. Long tests
+      # need both the default module cache and checksum database to be writable.
+      - name: Prepare writable test module and checksum caches
+        run: |
+          set -euo pipefail
+          sudo install -d -m 0755 -o "$(id -u)" -g "$(id -g)" \
+            /nonexist-gopath/pkg \
+            /nonexist-gopath/pkg/mod \
+            /nonexist-gopath/pkg/sumdb
+          test -w /nonexist-gopath/pkg/mod
+          test -w /nonexist-gopath/pkg/sumdb
+          lscpu
+          free -h
+          for f in /sys/fs/cgroup/cpu.max /sys/fs/cgroup/memory.max; do
+            if [[ -r "$f" ]]; then
+              printf '%s: ' "$f"
+              cat "$f"
+            fi
+          done
+
+      # Split all.bash into its original build and test phases so the
+      # expensive regression test can run in isolation before the full suite.
+      - name: Build Tango toolchain
+        working-directory: tango/src
+        run: |
+          set -euo pipefail
+          unset GOROOT CGO_ENABLED
+          bash ./make.bash --no-banner 2>&1 | tee "$RUNNER_TEMP/tango-build.log"
+
+      - name: Diagnose GoId preemption on candidate and original base
+        working-directory: tango
+        env:
+          BASE: ${{ steps.merge.outputs.base }}
+        run: |
+          set -euo pipefail
+          unset GOROOT GOMODCACHE CGO_ENABLED GOFLAGS GODEBUG
+          candidate="$PWD"
+          baseline="$RUNNER_TEMP/tango-base"
+          diag="$RUNNER_TEMP/goid-diag"
+          mkdir -p "$diag"
+          printf 'tree\tmode\tstage\tstatus\n' > "$diag/results.tsv"
+
+          probe() (
+            set -euo pipefail
+            local tree="$1" label="$2" mode="$3"
+            local dir="$diag/$label-$mode" rc=0 hook pkg flag
+            mkdir -p "$dir" || return 2
+            export PATH="$tree/bin:$PATH"
+            export GOPATH="$dir/gopath"
+            export GOCACHE="$GOPATH/cache"
+            export GOMODCACHE="$GOCACHE"
+            unset GOFLAGS GODEBUG
+            export GOTRACEBACK=system
+            case "$mode" in
+              normal) ;;
+              gccheckmark) export GODEBUG=gccheckmark=1 ;;
+              mayMoreStackPreempt|mayMoreStackMove)
+                hook="runtime.$mode"
+                local -a flags=()
+                for flag in -gcflags -asmflags; do
+                  for pkg in 'runtime/...' reflect sync; do
+                    flags+=("$flag=$pkg=-d=maymorestack=$hook")
+                  done
+                  flags+=("$flag=runtime/testdata/...=")
+                done
+                export GOFLAGS="${flags[*]}"
+                ;;
+              *) return 2 ;;
+            esac
+            cd "$dir" || return 2
+            # Extract the exact program and dependency from this tree's test.
+            python3 - "$tree/src/runtime/goid_test.go" <<'PYCODE' || return 2
+          import pathlib, re, sys
+          source = pathlib.Path(sys.argv[1]).read_text()
+          fn = source.split('func genGoIdAsyncPreemptionMain(', 1)[1]
+          program = re.search(r'source := `([^`]+)`', fn).group(1)
+          mod, version = re.search(r'\{"([^"\n]+)",\s*"([^"\n]+)"\}', source.split('var goidPkgs', 1)[1]).groups()
+          pathlib.Path('main.go').write_text(program.replace('%s', mod).replace('%%', '%'))
+          pathlib.Path('go.mod').write_text(f'module main\n\ngo 1.16\n\nrequire {mod} {version}\n')
+          pathlib.Path('dependency.txt').write_text(mod)
+          PYCODE
+            printf '\n=== %s / %s ===\n' "$label" "$mode"
+            printf 'GODEBUG=%s\nGOFLAGS=%s\n' "${GODEBUG-}" "${GOFLAGS-}" > environment.log
+            timeout --signal=TERM --kill-after=15s 5m \
+              "$tree/bin/go" mod download "$(cat dependency.txt)" > download.log 2>&1 || rc=$?
+            printf '%s\t%s\tdownload\t%s\n' "$label" "$mode" "$rc" >> "$diag/results.tsv"
+            if ((rc)); then cat download.log; chmod -R u+w "$GOPATH" 2>/dev/null || true; rm -rf "$GOPATH"; return "$rc"; fi
+            timeout --signal=TERM --kill-after=15s 12m \
+              "$tree/bin/go" build -opt=beast -o probe main.go > build.log 2>&1 || rc=$?
+            printf '%s\t%s\tbuild\t%s\n' "$label" "$mode" "$rc" >> "$diag/results.tsv"
+            if ((rc)); then tail -n 80 build.log; chmod -R u+w "$GOPATH" 2>/dev/null || true; rm -rf "$GOPATH"; return "$rc"; fi
+            # Signal the actual executable (not go run), capturing its stack.
+            /usr/bin/time -v -o time.log \
+              timeout --signal=QUIT --kill-after=20s 120s ./probe > run.log 2>&1 || rc=$?
+            printf '%s\t%s\trun\t%s\n' "$label" "$mode" "$rc" >> "$diag/results.tsv"
+            if ((rc)); then head -n 80 run.log; fi
+            cat time.log
+            # Keep the logs, not large disposable Go caches or binaries.
+            chmod -R u+w "$GOPATH" 2>/dev/null || true; rm -rf "$GOPATH" probe
+            return "$rc"
+          )
+
+          # A diagnostic failure is recorded, but does not prevent testing the
+          # other modes or the original tree on the same runner.
+          result=0
+          for mode in normal gccheckmark mayMoreStackPreempt mayMoreStackMove; do
+            probe "$candidate" candidate "$mode" || result=1
+          done
+          git worktree add --detach "$baseline" "$BASE"
+          (
+            cd "$baseline/src"
+            bash ./make.bash --no-banner 2>&1 | tee "$diag/baseline-build.log"
+          )
+          for mode in normal gccheckmark mayMoreStackPreempt mayMoreStackMove; do
+            probe "$baseline" baseline "$mode" || result=1
+          done
+          cat "$diag/results.tsv"
+          {
+            echo '### GoId diagnostics (no release publication)'
+            echo '```text'
+            cat "$diag/results.tsv"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$result"
+
+      - name: Upload diagnostic logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: tango-goid-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/tango-build.log
+            ${{ runner.temp }}/merge-conflicts.diff
+            ${{ runner.temp }}/goid-diag/results.tsv
+            ${{ runner.temp }}/goid-diag/baseline-build.log
+            ${{ runner.temp }}/goid-diag/*/main.go
+            ${{ runner.temp }}/goid-diag/*/go.mod
+            ${{ runner.temp }}/goid-diag/*/*.log
+          if-no-files-found: warn
+          retention-days: 14
