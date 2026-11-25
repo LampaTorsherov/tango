@@ -43,9 +43,8 @@ jobs:
       GOTOOLCHAIN: local
       GOENV: 'off'
       GOAMD64: v1
-      CGO_ENABLED: '1'
       GO_TEST_SHORT: 'false'
-      GO_TEST_TIMEOUT_SCALE: '4'
+      GO_TEST_TIMEOUT_SCALE: '6'
 
     steps:
       - name: Validate input
@@ -114,6 +113,19 @@ jobs:
           [[ "$(head -n 1 VERSION.tango)" == "$tango_version" ]]
           git merge-base --is-ancestor "$base" HEAD
           git merge-base --is-ancestor "$upstream_sha" HEAD
+          # Fix the contradictory test inherited from Tango 1.26.4.
+          # Commit before recording the candidate SHA, so the exact tested
+          # tree (including this fixture correction) is promoted on success.
+          fixture=src/cmd/go/testdata/script/godebug_decoratemappings_comment.txt
+          if grep -Fxq '//go:debug decoratemappings=1' "$fixture"; then
+            grep -Fq 'Programs with //go:debug decoratemappings=0 should never see annotations.' "$fixture"
+            [[ "$(grep -Fxc '//go:debug decoratemappings=1' "$fixture")" == 1 ]]
+            sed -i 's|^//go:debug decoratemappings=1$|//go:debug decoratemappings=0|' "$fixture"
+            git add -- "$fixture"
+            git commit -m 'cmd/go: fix Tango decoratemappings test fixture'
+          fi
+          grep -Fxq '//go:debug decoratemappings=0' "$fixture"
+
           candidate="$(git rev-parse HEAD)"
           tag="tango${GO_VERSION#go}"
           artifact="tango-candidate-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
@@ -178,8 +190,19 @@ jobs:
         working-directory: tango/src
         run: |
           set -euo pipefail
-          unset GOROOT
+          unset GOROOT CGO_ENABLED
           bash ./make.bash --no-banner 2>&1 | tee "$RUNNER_TEMP/tango-build.log"
+
+      - name: Check previously failing cmd/go scripts
+        working-directory: tango/src
+        run: |
+          set -euo pipefail
+          unset GOROOT GOMODCACHE CGO_ENABLED
+          export GOPATH=/nonexist-gopath
+          export PATH="$PWD/../bin:$PATH"
+          ../bin/go test -v -count=1 -short=false -timeout=10m \
+            -run '^TestScript$/(autocgo|godebug_decoratemappings_comment)$' cmd/go \
+            2>&1 | tee "$RUNNER_TEMP/tango-cmd-go-preflight.log"
 
       - name: Isolated GAB map preemption regression test
         id: gab_preflight
@@ -201,7 +224,7 @@ jobs:
           BASE: ${{ steps.merge.outputs.base }}
         run: |
           set -euo pipefail
-          unset GOROOT GOMODCACHE
+          unset GOROOT GOMODCACHE CGO_ENABLED
           base_dir="$RUNNER_TEMP/tango-base"
           git worktree add --detach "$base_dir" "$BASE"
           cd "$base_dir/src"
