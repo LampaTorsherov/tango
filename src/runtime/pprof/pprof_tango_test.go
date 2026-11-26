@@ -12,7 +12,13 @@ import (
 func TestCPUProfileMultiCallstack(t *testing.T) {
 	matches := matchAndAvoidStacks(stackContains, []string{"runtime/pprof.f3", "runtime/pprof.ffinal"}, avoidFunctions())
 	testCPUProfile(t, matches, func(dur time.Duration) {
-		f3()
+		deadline := time.Now().Add(dur)
+		for {
+			f3()
+			if !time.Now().Before(deadline) {
+				break
+			}
+		}
 	})
 }
 
