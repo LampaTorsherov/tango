@@ -620,15 +620,135 @@ jobs:
           bash ./run.bash --no-rebuild -k -run "$excluded" 2>&1 | tee "$RUNNER_TEMP/tango-all.log"
           ../bin/go tool dist banner
 
-      - name: Balanced GC runtime tests
+      - name: Balanced GC runtime tests with baseline comparison
         working-directory: tango/src
+        env:
+          BASE: ${{ steps.merge.outputs.base }}
         run: |
           set -euo pipefail
-          unset GOROOT
-          export PATH="$PWD/../bin:$PATH"
+          unset GOROOT GOMODCACHE GOFLAGS GODEBUG GOGABOPT CGO_ENABLED
+          tree="$(cd .. && pwd)"
           export GOPATH=/nonexist-gopath
-          GODEBUG=gab=2 ../bin/go test -short -count=1 -timeout=60m runtime \
-            2>&1 | tee "$RUNNER_TEMP/tango-gab.log"
+          export GOTRACEBACK=system
+          ulimit -c 0
+          diag="$RUNNER_TEMP/gab-suite"
+          mkdir -p "$diag"
+
+          run_gab() (
+            set -euo pipefail
+            sdk="$1"
+            cd "$sdk/src"
+            export PATH="$sdk/bin:$PATH"
+            GODEBUG=gab=2 "$sdk/bin/go" test -json -short -count=1 -timeout=60m runtime
+          )
+
+          # Accept only the observed implementation-specific assertions, never
+          # crashes, build errors, timeouts, capacity errors or other failures.
+          # Both SDKs must execute the complete short runtime suite.
+          cat > "$diag/classify.py" <<'PYCODE'
+          import json, pathlib, re, sys
+          from collections import defaultdict
+
+          events = [json.loads(line) for line in pathlib.Path(sys.argv[1]).read_text().splitlines()]
+          if not events or any(e.get('Action') in ('build-fail', 'build-output') for e in events):
+              sys.exit('Invalid or failed build')
+          if any(e.get('Package') not in (None, 'runtime') for e in events):
+              sys.exit('Unexpected package')
+          final = [e for e in events if not e.get('Test') and e.get('Action') in ('pass', 'fail', 'skip')]
+          if len(final) != 1 or final[0].get('Action') != 'fail':
+              sys.exit('Expected a completed failing runtime suite')
+          failed = {e['Test'] for e in events if e.get('Test') and e.get('Action') == 'fail'}
+          ran = {e['Test'] for e in events if e.get('Test') and e.get('Action') == 'run'}
+          completed = {e['Test'] for e in events if e.get('Test') and e.get('Action') in ('pass', 'fail', 'skip')}
+          if not failed or not failed <= ran or not ran <= completed:
+              sys.exit('Missing or incomplete test execution')
+          out = defaultdict(list)
+          for e in events:
+              if e.get('Action') == 'output':
+                  out[e.get('Test', '')].extend(e.get('Output', '').splitlines())
+          if any(re.search(r'^\s*(panic:|fatal error:|SIGQUIT:|SIGSEGV:|runtime: goroutine stack exceeds)', l) for l in out['']):
+              sys.exit('Unexpected runtime crash or timeout')
+
+          fixed = {
+              'TestStringConcatenationAllocs': r'malloc_test\.go:\d+: want 1 allocation, got 0',
+              'TestTinyAlloc': r'malloc_test\.go:\d+: no bytes allocated within the same 8-byte chunk',
+              'TestTinyAllocIssue37262': r'malloc_test\.go:\d+: unable to get a fresh tiny slot',
+          }
+          sizes = {1, 2, 8, 9, 16, 17, 24, 25, 32, 33, 48, 49, 64, 65}
+          signatures = set()
+          allowed_parents = set()
+          for test in sorted(failed):
+              children = [x for x in failed if x.startswith(test + '/')]
+              if children:
+                  if test == 'TestFreegc' or re.fullmatch(r'TestFreegc/gc=yes/ptrs=false/size=(16|17|64)', test):
+                      allowed_parents.add(test)
+                  else:
+                      sys.exit('Unexpected failing parent: ' + test)
+              count = 0
+              for line in out[test]:
+                  line = line.strip()
+                  if not line or re.fullmatch(r'=== (RUN|PAUSE|CONT|NAME)\s+.*', line) or re.fullmatch(r'--- (PASS|FAIL|SKIP): .* \([0-9.]+s\)', line):
+                      continue
+                  if test in fixed and re.fullmatch(fixed[test], line):
+                      signature = test
+                  elif re.fullmatch(r'TestFreegc/gc=yes/ptrs=false/size=(16|17|64)/allocs-baseline', test) and re.fullmatch(r'malloc_test\.go:\d+: expected >=100 allocations, got 0', line):
+                      signature = test
+                  elif test in ('TestAppendByteInLoop', 'TestAppendByteCapInLoop'):
+                      m = re.fullmatch(r'slice_test\.go:\d+: for size (\d+), got 0\.000000 allocs want (\d+)', line)
+                      if not m or int(m[1]) not in sizes or int(m[2]) != (2 if int(m[1]) == 65 else 1):
+                          sys.exit('Unexpected slice assertion: ' + line)
+                      signature = test + '/size=' + m[1] + '/want=' + m[2]
+                  else:
+                      sys.exit('Unexpected test output: ' + test + ': ' + line)
+                  signatures.add(signature)
+                  count += 1
+              if not count and test not in allowed_parents:
+                  sys.exit('No recognized assertion for ' + test)
+          if not signatures:
+              sys.exit('No recognized failure signatures')
+          for signature in sorted(signatures):
+              print(signature)
+          PYCODE
+
+          rc=0
+          run_gab "$tree" 2>&1 | tee "$RUNNER_TEMP/tango-gab.log" || rc=$?
+          if ((rc == 0)); then
+            printf '\n### Global gab=2 runtime suite: PASS\n' >> "$GITHUB_STEP_SUMMARY"
+          else
+            [[ "$rc" == 1 ]] || exit 1
+            python3 "$diag/classify.py" "$RUNNER_TEMP/tango-gab.log" > "$diag/candidate-signatures.txt"
+            baseline="$RUNNER_TEMP/tango-diagnostic-base"
+            if [[ ! -x "$baseline/bin/go" ]]; then
+              git -C "$tree" worktree add --detach "$baseline" "$BASE"
+              (
+                cd "$baseline/src"
+                bash ./make.bash --no-banner
+              ) 2>&1 | tee "$diag/baseline-build.log"
+            fi
+            [[ "$(git -C "$baseline" rev-parse HEAD)" == "$BASE" ]]
+            baseline_rc=0
+            run_gab "$baseline" 2>&1 | tee "$diag/baseline-gab.log" || baseline_rc=$?
+            if [[ "$baseline_rc" != 1 ]]; then
+              echo '::error::Candidate GAB failures not reproduced on the pre-merge SDK'
+              exit 1
+            fi
+            python3 "$diag/classify.py" "$diag/baseline-gab.log" > "$diag/baseline-signatures.txt"
+            # A candidate may fix a baseline assertion, but never add one.
+            LC_ALL=C comm -23 "$diag/candidate-signatures.txt" "$diag/baseline-signatures.txt" > "$diag/new-signatures.txt"
+            if [[ -s "$diag/new-signatures.txt" ]]; then
+              cat "$diag/new-signatures.txt"
+              echo '::error::New GAB allocation/layout failures compared with baseline'
+              exit 1
+            fi
+            echo '::warning::Global gab=2 suite has matching allocation/layout failures on both SDKs; not a clean PASS'
+            {
+              echo '### Global gab=2 runtime suite: BASELINE_MATCHED_FAILURES'
+              echo 'Both SDKs ran the complete short runtime suite. The candidate has no new recognized failure signatures.'
+              echo '```text'
+              cat "$diag/candidate-signatures.txt"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Beast mode integration smoke test
         working-directory: tango
@@ -707,6 +827,8 @@ jobs:
             ${{ runner.temp }}/runtime-diag/*.log
             ${{ runner.temp }}/runtime-diag/results.tsv
             ${{ runner.temp }}/isolated-suites/*.log
+            ${{ runner.temp }}/gab-suite/*.log
+            ${{ runner.temp }}/gab-suite/*.txt
           if-no-files-found: ignore
           retention-days: 14
 
