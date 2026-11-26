@@ -21,6 +21,21 @@ var (
 	netpollWakeSig atomic.Uint32      // used to avoid duplicate calls of netpollBreak
 )
 
+// netpollPackData stores pd and its fdseq in the epoll data field of ev as
+// a taggedPointer. A nil pd marks the netpollBreak eventfd: netpollopen always
+// registers a non-nil *pollDesc, so netpollUnpackData can tell the two apart
+// by the pointer alone, on any word size or endianness.
+func netpollPackData(ev *linux.EpollEvent, pd *pollDesc, fdseq uintptr) {
+	*(*taggedPointer)(unsafe.Pointer(&ev.Data)) = taggedPointerPack(unsafe.Pointer(pd), fdseq)
+}
+
+// netpollUnpackData returns the pollDesc and fdseq stored by netpollPackData.
+// pd is nil for the netpollBreak eventfd.
+func netpollUnpackData(ev *linux.EpollEvent) (pd *pollDesc, fdseq uintptr) {
+	tp := *(*taggedPointer)(unsafe.Pointer(&ev.Data))
+	return (*pollDesc)(tp.pointer()), tp.tag()
+}
+
 func netpollinit() {
 	var errno uintptr
 	epfd, errno = linux.EpollCreate1(linux.EPOLL_CLOEXEC)
@@ -36,7 +51,7 @@ func netpollinit() {
 	ev := linux.EpollEvent{
 		Events: linux.EPOLLIN,
 	}
-	*(**uintptr)(unsafe.Pointer(&ev.Data)) = &netpollEventFd
+	netpollPackData(&ev, nil, 0)
 	errno = linux.EpollCtl(epfd, linux.EPOLL_CTL_ADD, efd, &ev)
 	if errno != 0 {
 		println("runtime: epollctl failed with", errno)
@@ -52,8 +67,7 @@ func netpollIsPollDescriptor(fd uintptr) bool {
 func netpollopen(fd uintptr, pd *pollDesc) uintptr {
 	var ev linux.EpollEvent
 	ev.Events = linux.EPOLLIN | linux.EPOLLOUT | linux.EPOLLRDHUP | linux.EPOLLET
-	tp := taggedPointerPack(unsafe.Pointer(pd), pd.fdseq.Load())
-	*(*taggedPointer)(unsafe.Pointer(&ev.Data)) = tp
+	netpollPackData(&ev, pd, pd.fdseq.Load())
 	return linux.EpollCtl(epfd, linux.EPOLL_CTL_ADD, int32(fd), &ev)
 }
 
@@ -141,7 +155,9 @@ retry:
 			continue
 		}
 
-		if *(**uintptr)(unsafe.Pointer(&ev.Data)) == &netpollEventFd {
+		pd, tag := netpollUnpackData(&ev)
+		// pd == nil denotes a netpollBreak eventfd.
+		if pd == nil {
 			if ev.Events != linux.EPOLLIN {
 				println("runtime: netpoll: eventfd ready for", ev.Events)
 				throw("runtime: netpoll: eventfd ready for something unexpected")
@@ -167,9 +183,6 @@ retry:
 			mode += 'w'
 		}
 		if mode != 0 {
-			tp := *(*taggedPointer)(unsafe.Pointer(&ev.Data))
-			pd := (*pollDesc)(tp.pointer())
-			tag := tp.tag()
 			if pd.fdseq.Load() == tag {
 				pd.setEventErr(ev.Events == linux.EPOLLERR, tag)
 				delta += netpollready(&toRun, &pollers, pd, mode)

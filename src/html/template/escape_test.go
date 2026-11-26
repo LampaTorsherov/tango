@@ -984,7 +984,6 @@ func TestEscapeSet(t *testing.T) {
 			t.Errorf("want\n\t%q\ngot\n\t%q", test.want, got)
 		}
 	}
-
 }
 
 func TestErrors(t *testing.T) {
@@ -1258,7 +1257,6 @@ func TestErrors(t *testing.T) {
 		// Check that we get the same error if we call Execute again.
 		if err := tmpl.Execute(buf, nil); err == nil || err.Error() != got {
 			t.Errorf("input=%q: unexpected error on second call %q", test.input, err)
-
 		}
 	}
 }
@@ -1863,7 +1861,7 @@ func TestEscapeText(t *testing.T) {
 		},
 		{
 			"<script>function f() {`${ function f() { `${1}` } }`}",
-			context{state: stateJS, element: elementScript, jsCtx: jsCtxDivOp},
+			context{state: stateJS, element: elementScript, jsCtx: jsCtxRegexp},
 		},
 		{
 			"<script>`${ { `` }",
@@ -1884,6 +1882,14 @@ func TestEscapeText(t *testing.T) {
 		{
 			"<script>`${ `}",
 			context{state: stateJSTmplLit, element: elementScript, jsBraceDepth: []int{0}},
+		},
+		{
+			"<script>`${1}${",
+			context{state: stateJS, element: elementScript, jsCtx: jsCtxRegexp, jsBraceDepth: []int{0}},
+		},
+		{
+			"<script>`${`${1}${",
+			context{state: stateJS, element: elementScript, jsCtx: jsCtxRegexp, jsBraceDepth: []int{0, 0}},
 		},
 	}
 
@@ -2277,5 +2283,115 @@ func TestMetaContentEscapeGODEBUG(t *testing.T) {
 	want := `<meta http-equiv="refresh" content="asd; url=javascript:alert(1); asd; url=vbscript:alert(1); asd">`
 	if got := b.String(); got != want {
 		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestIssue81821(t *testing.T) {
+	tmpl := Must(New("test").Parse("<script>const s = `${1}${/{{.}}/g}`</script>"))
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, `x/.exec(alert(1))}`); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	want := "<script>const s = `${1}${/x\\/\\.exec\\(alert\\(1\\)\\)\\}/g}`</script>"
+	if got := buf.String(); got != want {
+		t.Errorf("got:  %s\nwant: %s", got, want)
+	}
+}
+
+func TestCVE202656858(t *testing.T) {
+	tests := []struct {
+		name  string
+		tmpl  string
+		input string
+		want  string
+	}{
+		{
+			name:  "regexp after open brace in if block",
+			tmpl:  `<script>if(true){/{{.}}/g.test("x")}</script>`,
+			input: "a.b",
+			want:  `<script>if(true){/a\.b/g.test("x")}</script>`,
+		},
+		{
+			name:  "regexp after close brace",
+			tmpl:  `<script>if(true){x=1}/{{.}}/g.test("x")</script>`,
+			input: "a.b",
+			want:  `<script>if(true){x=1}/a\.b/g.test("x")</script>`,
+		},
+		{
+			name:  "regexp pathological attacker input",
+			tmpl:  `<script>if(true){/{{.}}/g.test("x")}</script>`,
+			input: `./;alert(1);var q=/.`,
+			want:  `<script>if(true){/\.\/;alert\(1\);var q=\/\./g.test("x")}</script>`,
+		},
+		{
+			name:  "regexp after open brace in template literal",
+			tmpl:  "<script>`${ (function(){/{{.}}/g.test(x)}) }`</script>",
+			input: "a.b",
+			want:  "<script>`${ (function(){/a\\.b/g.test(x)}) }`</script>",
+		},
+		{
+			name:  "regexp after close brace in template literal",
+			tmpl:  "<script>`${ (function(){}/{{.}}/g.test(x)) }`</script>",
+			input: "a.b",
+			want:  "<script>`${ (function(){}/a\\.b/g.test(x)) }`</script>",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmpl := Must(New("test").Parse(tt.tmpl))
+			var buf bytes.Buffer
+			if err := tmpl.Execute(&buf, tt.input); err != nil {
+				t.Fatalf("Execute: %v", err)
+			}
+			if got := buf.String(); got != tt.want {
+				t.Errorf("got:  %s\nwant: %s", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIssue81823(t *testing.T) {
+	tests := []struct {
+		name  string
+		tmpl  string
+		input string
+		want  string
+	}{
+		{
+			name:  "yield",
+			tmpl:  `<script>function* rules(){yield /{{.}}/g}</script>`,
+			input: `/;alert(1)//`,
+			want:  `<script>function* rules(){yield /\/;alert\(1\)\/\//g}</script>`,
+		},
+		{
+			name:  "property yield",
+			tmpl:  "<script>const pct = bond.yield / 100;\nconst user = {{.}}; // state\n</script>",
+			input: `1;pwned=1;0`,
+			want:  "<script>const pct = bond.yield / 100;\nconst user = \"1;pwned=1;0\"; \n</script>",
+		},
+		{
+			name:  "private yield",
+			tmpl:  "<script>class Bond { #yield = 4; pct() { return this.#yield / 100; } }\nconst user = {{.}}; // state\n</script>",
+			input: `1;pwned=1;0`,
+			want:  "<script>class Bond { #yield = 4; pct() { return this.#yield / 100; } }\nconst user = \"1;pwned=1;0\"; \n</script>",
+		},
+		{
+			name:  "property in",
+			tmpl:  "<script>const kb = traffic.in / 1024;\nconst user = {{.}}; // state\n</script>",
+			input: `1;pwned=1;0`,
+			want:  "<script>const kb = traffic.in / 1024;\nconst user = \"1;pwned=1;0\"; \n</script>",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmpl := Must(New("test").Parse(tt.tmpl))
+			var buf strings.Builder
+			if err := tmpl.Execute(&buf, tt.input); err != nil {
+				t.Fatalf("Execute: %v", err)
+			}
+			if got := buf.String(); got != tt.want {
+				t.Errorf("got:  %s\nwant: %s", got, tt.want)
+			}
+		})
 	}
 }

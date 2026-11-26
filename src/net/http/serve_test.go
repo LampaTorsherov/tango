@@ -18,7 +18,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"internal/synctest"
 	"internal/testenv"
 	"io"
 	"log"
@@ -44,6 +43,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -813,6 +813,92 @@ func testServerTimeoutsWithTimeout(t *testing.T, timeout time.Duration, mode tes
 		}
 	}
 	return nil
+}
+
+func TestServerUnencryptedHTTP2HeaderTimeout(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		f    func(*fakeNetConn)
+	}{{
+		name: "client sends nothing",
+		f: func(conn *fakeNetConn) {
+		},
+	}, {
+		name: "client sends slowly",
+		f: func(conn *fakeNetConn) {
+			// Trickling out writes should not extend the deadline.
+			conn.Write([]byte("PRI"))
+			time.Sleep(100 * time.Millisecond)
+			conn.Write([]byte(" * "))
+			time.Sleep(100 * time.Millisecond)
+			conn.Write([]byte("HTT"))
+			time.Sleep(100 * time.Millisecond)
+		},
+	}, {
+		name: "header read expires",
+		f: func(conn *fakeNetConn) {
+			// Time spent waiting for the HTTP/2 preface should count against
+			// time spent waiting for HTTP/1 headers.
+			time.Sleep(100 * time.Millisecond)
+			conn.Write([]byte("GET / HTTP/1.1\r\nHost: example.tld\r\n"))
+		},
+	}} {
+		t.Run(test.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				listener := fakeNetListen()
+				defer listener.Close()
+
+				srv := &Server{
+					Protocols:         new(Protocols),
+					ReadHeaderTimeout: 1 * time.Second,
+				}
+				srv.Protocols.SetHTTP1(true)
+				srv.Protocols.SetUnencryptedHTTP2(true)
+				go srv.Serve(listener)
+
+				conn := listener.connect()
+				go test.f(conn)
+
+				start := time.Now()
+				_, err := io.ReadAll(conn)
+				if err != nil {
+					t.Errorf("ReadAll from server: %v, want EOF", err)
+				}
+				if got, want := time.Since(start), srv.ReadHeaderTimeout; got != want {
+					t.Errorf("connection closed after %v, want %v", got, want)
+				}
+			})
+		})
+	}
+}
+
+func TestServerReadHeaderTimeoutIsCleared(t *testing.T) {
+	runSynctest(t, testServerReadHeaderTimeoutIsCleared,
+		testAddMode{http2UnencryptedMode})
+}
+func testServerReadHeaderTimeoutIsCleared(t *testing.T, mode testMode) {
+	const timeout = time.Second
+	cst := newClientServerTest(t, mode, HandlerFunc(func(w ResponseWriter, r *Request) {
+		w.WriteHeader(200)
+		NewResponseController(w).Flush()
+		time.Sleep(2 * timeout)
+		io.WriteString(w, "ok")
+	}), func(s *Server) {
+		s.ReadHeaderTimeout = timeout
+	}, optFakeNet)
+
+	res, err := cst.c.Get(cst.ts.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(res.Body)
+	res.Body.Close()
+	if err != nil {
+		t.Fatalf("reading response body after ReadHeaderTimeout: %v", err)
+	}
+	if want := "ok"; string(got) != want {
+		t.Fatalf("response body = %q, want %q", got, want)
+	}
 }
 
 func TestServerReadTimeout(t *testing.T) { run(t, testServerReadTimeout) }
@@ -7167,6 +7253,33 @@ func testMaxBytesHandler(t *testing.T, mode testMode, maxSize, requestSize int64
 	})
 }
 
+func TestServerMaxBytesHeaderRace(t *testing.T) {
+	runSynctest(t, func(t *testing.T, mode testMode) {
+		cst := newClientServerTest(t, mode, MaxBytesHandler(HandlerFunc(func(w ResponseWriter, r *Request) {
+			var wg sync.WaitGroup
+			defer wg.Wait()
+			// MaxBytesHandler will hit its set limit when reading the request
+			// body. When this happens, it will make sure that the connection
+			// is closed after this response. In doing so, it will set
+			// "Connection: close" header. This must not race with any header
+			// that is explicitly set by the handler.
+			wg.Go(func() {
+				io.ReadAll(r.Body)
+			})
+			w.Header().Set("X-Test", "1")
+			w.WriteHeader(413)
+		}), 4), optFakeNet)
+		res, err := cst.c.Post(cst.ts.URL, "text/plain", strings.NewReader("hello"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer res.Body.Close()
+		if res.StatusCode != 413 {
+			t.Errorf("want status 413, got %v", res.Status)
+		}
+	})
+}
+
 func TestEarlyHints(t *testing.T) {
 	ht := newHandlerTest(HandlerFunc(func(w ResponseWriter, r *Request) {
 		h := w.Header()
@@ -7598,4 +7711,216 @@ func testServerTLSNextProtos(t *testing.T, mode testMode) {
 	if !slices.Equal(nextProtos, wantNextProtos) {
 		t.Fatalf("after running test: original NextProtos slice = %v, want %v", nextProtos, wantNextProtos)
 	}
+}
+
+func TestServerConnectionReuse(t *testing.T) {
+	for _, test := range []struct {
+		name             string
+		message          []string
+		handler          HandlerFunc
+		continueBodySize int
+		want100Continue  bool
+		wantResponse     int
+		wantReused       bool
+		skip             string
+	}{{
+		name: "small body",
+		message: []string{
+			"POST / HTTP/1.1",
+			"Host: example.tld",
+			"Content-Length: 1",
+			"",
+			"x",
+		},
+		wantResponse: 200,
+		wantReused:   true,
+	}, {
+		name: "large body",
+		message: []string{
+			"POST / HTTP/1.1",
+			"Host: example.tld",
+			"Content-Length: 300000", // more than maxPostHandlerReadBytes
+			"",
+			// body is never sent
+		},
+		wantResponse: 200,
+		wantReused:   false,
+	}, {
+		name: "small body full duplex",
+		message: []string{
+			"POST / HTTP/1.1",
+			"Host: example.tld",
+			"Content-Length: 1",
+			"",
+			"x",
+		},
+		handler: func(w ResponseWriter, req *Request) {
+			// Enable full duplex to avoid trying to read the request before
+			// writing the response.
+			NewResponseController(w).EnableFullDuplex()
+		},
+		wantResponse: 200,
+		wantReused:   true,
+	}, {
+		name: "large body full duplex",
+		message: []string{
+			"POST / HTTP/1.1",
+			"Host: example.tld",
+			"Content-Length: 300000", // more than maxPostHandlerReadBytes
+			"",
+			// body is never sent
+		},
+		handler: func(w ResponseWriter, req *Request) {
+			// Enable full duplex to avoid trying to read the request before
+			// writing the response.
+			NewResponseController(w).EnableFullDuplex()
+		},
+		wantResponse: 200,
+		wantReused:   false,
+	}, {
+		// Send a request with a 1-byte body, which the server handler never reads.
+		// We should either send a 100-Continue and read the body
+		// or we should close the connection.
+		//
+		// Right now, the server hangs trying to read the request body
+		// the client isn't sending.
+		skip: "https://go.dev/issue/75933",
+
+		name: "100-continue unconsumed small body",
+		message: []string{
+			"POST / HTTP/1.1",
+			"Host: example.tld",
+			"Expect: 100-continue",
+			"Content-Length: 1",
+			"",
+			// body is never sent
+		},
+		want100Continue: false,
+		wantResponse:    200,
+		wantReused:      true,
+	}, {
+		name: "100-continue unconsumed large body",
+		message: []string{
+			"POST / HTTP/1.1",
+			"Host: example.tld",
+			"Expect: 100-continue",
+			"Content-Length: 300000", // more than maxPostHandlerReadBytes
+			"",
+			// body is never sent
+		},
+		want100Continue: false,
+		wantResponse:    200,
+		wantReused:      false,
+	}, {
+		name: "100-continue consumed small body",
+		message: []string{
+			"POST / HTTP/1.1",
+			"Host: example.tld",
+			"Expect: 100-continue",
+			"Content-Length: 1",
+			"",
+		},
+		handler: func(w ResponseWriter, req *Request) {
+			io.Copy(io.Discard, req.Body)
+		},
+		want100Continue:  true,
+		continueBodySize: 1,
+		wantResponse:     200,
+		wantReused:       true,
+	}, {
+		name: "small wrapped body",
+		message: []string{
+			"POST / HTTP/1.1",
+			"Host: example.tld",
+			"Content-Length: 1",
+			"",
+			"x",
+		},
+		handler: func(w ResponseWriter, req *Request) {
+			// Enable full duplex to avoid trying to read the request before
+			// writing the response.
+			NewResponseController(w).EnableFullDuplex()
+
+			// Middleware wraps the Request.Body in some other type.
+			req.Body = struct{ io.ReadCloser }{req.Body}
+		},
+		wantResponse: 200,
+		wantReused:   true,
+	}, {
+		name: "large wrapped body",
+		message: []string{
+			"POST / HTTP/1.1",
+			"Host: example.tld",
+			"Content-Length: 300000", // more than maxPostHandlerReadBytes
+			"",
+		},
+		handler: func(w ResponseWriter, req *Request) {
+			// Enable full duplex to avoid trying to read the request before
+			// writing the response.
+			NewResponseController(w).EnableFullDuplex()
+
+			// Middleware wraps the Request.Body in some other type.
+			req.Body = struct{ io.ReadCloser }{req.Body}
+		},
+		wantResponse: 200,
+		wantReused:   false,
+	}} {
+		t.Run(test.name, func(t *testing.T) {
+			if test.skip != "" {
+				t.Skip(test.skip)
+			}
+			synctest.Test(t, func(t *testing.T) {
+				st := newHTTP1ServerTest(t, test.handler)
+				conn := st.dial()
+				conn.writeMessage(test.message...)
+				resp := conn.readResponse()
+				if got, want := resp.StatusCode == 100, test.want100Continue; got != want {
+					t.Fatalf("100-Continue response: %v, want %v", got, want)
+				}
+				if resp.StatusCode == 100 {
+					conn.conn.Write(bytes.Repeat([]byte("x"), test.continueBodySize))
+					resp = conn.readResponse()
+				}
+				if got, want := resp.StatusCode, test.wantResponse; got != want {
+					t.Fatalf("got response %v, want %v", got, want)
+				}
+				if test.wantReused {
+					conn.wantIdle()
+				} else {
+					conn.wantClosed()
+				}
+			})
+		})
+	}
+}
+
+// A handler may close the request body itself. When it has not read the body
+// to EOF, Close drains the remainder; reaching the end of the body is the
+// expected outcome and must not be reported to the caller as an error.
+func TestServerRequestBodyCloseAfterPartialRead(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		closeErr := make(chan error, 1)
+		st := newHTTP1ServerTest(t, func(w ResponseWriter, req *Request) {
+			// Read part of the body, leaving the rest for Close to drain.
+			if _, err := io.ReadFull(req.Body, make([]byte, 2)); err != nil {
+				closeErr <- fmt.Errorf("reading request body: %v", err)
+				return
+			}
+			closeErr <- req.Body.Close()
+		})
+		conn := st.dial()
+		conn.writeMessage(
+			"POST / HTTP/1.1",
+			"Host: example.tld",
+			"Content-Length: 4",
+			"",
+			"test",
+		)
+		if got, want := conn.readResponse().StatusCode, 200; got != want {
+			t.Fatalf("got response %v, want %v", got, want)
+		}
+		if err := <-closeErr; err != nil {
+			t.Errorf("Request.Body.Close() = %v, want nil", err)
+		}
+	})
 }

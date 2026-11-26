@@ -1268,6 +1268,10 @@ func peimporteddlls() []string {
 	var dlls []string
 
 	for d := dr; d != nil; d = d.next {
+		if strings.ContainsAny(d.name, `/\:`) || strings.Contains(d.name, "..") || strings.HasPrefix(d.name, "-") || strings.HasPrefix(d.name, "@") {
+			Errorf("invalid imported DLL name %q", d.name)
+			continue
+		}
 		dlls = append(dlls, "-l"+strings.TrimSuffix(d.name, ".dll"))
 	}
 
@@ -1759,7 +1763,7 @@ func peCreateExportFile(ctxt *Link, libName string) (fname string) {
 	var buf bytes.Buffer
 
 	if ctxt.BuildMode == BuildModeCShared {
-		fmt.Fprintf(&buf, "LIBRARY %s\n", libName)
+		fmt.Fprintf(&buf, "LIBRARY %q\n", libName)
 	}
 	buf.WriteString("EXPORTS\n")
 
